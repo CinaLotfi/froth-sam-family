@@ -571,14 +571,22 @@ def parse_args():
         choices=["sam", "hqsam", "medsam"],
         help="Which model backend to train.",
     )
+    p.add_argument(
+        "--epochs",
+        type=int,
+        default=None,
+        help="Override Config.epochs (number of training epochs).",
+    )
     return p.parse_args()
-
 
 def main():
     args = parse_args()
 
-    # tell config which model we're using
+    # wire config
     C.model_name = args.model.lower()
+    if args.epochs is not None:
+        C.epochs = args.epochs  #  override default epochs
+
     C.setup()
     set_seed(C.seed)
     device = get_device()
@@ -595,7 +603,6 @@ def main():
         train_medsam(device)
     else:
         raise ValueError(f"Unknown model: {args.model}")
-
 
 if __name__ == "__main__":
     main()
