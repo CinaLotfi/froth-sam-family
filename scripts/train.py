@@ -13,11 +13,11 @@ from sam_froth.utils.losses import BCEDiceLoss
 from sam_froth.models import (
     load_sam_base,
     load_hqsam,
+    load_medsam,                      # 🔹 NEW
     boxes_to_1024_space,
     postprocess_masks_to_original,
 )
 from sam_froth.models.hqsam import encode_image_hq
-
 
 # --------- utils ---------
 def set_seed(seed: int = 1337):
@@ -461,6 +461,105 @@ def train_hqsam(device: torch.device):
     print("\nHQ-SAM training done.")
     print(f"Best mIoU: {best_iou:.4f}")
 
+def train_medsam(device: torch.device):
+    print("=== Training MedSAM ===")
+    train_loader, test_loader = build_loaders(device)
+
+    # model, decoder-only training (same pattern as SAM)
+    model = load_medsam(
+        checkpoint_path=C.medsam_checkpoint,
+        model_type=C.medsam_model_type,
+        device=device,
+    )
+
+    for p in model.parameters():
+        p.requires_grad = False
+    for p in model.mask_decoder.parameters():
+        p.requires_grad = True
+
+    optimizer = torch.optim.AdamW(
+        [p for p in model.mask_decoder.parameters() if p.requires_grad],
+        lr=C.lr,
+        weight_decay=C.weight_decay,
+    )
+    criterion = BCEDiceLoss(bce_weight=0.5)
+
+    # tag uses medsam_* instead of sam_*
+    model_tag = f"{C.model_name}_{C.medsam_model_type}_{C.train_mode}"
+    best_decoder_path = C.finetune_out / f"{model_tag}_decoder_best.pth"
+    last_decoder_path = C.finetune_out / f"{model_tag}_decoder_last.pth"
+    best_full_path = C.finetune_out / f"{model_tag}_full_best.pth"
+    last_full_path = C.finetune_out / f"{model_tag}_full_last.pth"
+
+    best_iou = -1.0
+
+    print(
+        f"Saving checkpoints under: {C.finetune_out} "
+        f"(tag={model_tag})"
+    )
+
+    for epoch in range(1, C.epochs + 1):
+        t0 = time.time()
+        tr_loss = train_one_epoch_sam(model, train_loader, optimizer, criterion, device)
+        val_iou = evaluate_epoch_sam(model, test_loader, device)
+        dt = time.time() - t0
+
+        print(
+            f"[MedSAM] Epoch {epoch:02d}/{C.epochs} | "
+            f"loss={tr_loss:.4f} | val mIoU={val_iou:.4f} | {dt:.1f}s"
+        )
+
+        # save last
+        torch.save(
+            {
+                "mask_decoder": model.mask_decoder.state_dict(),
+                "model_type": C.medsam_model_type,
+                "epoch": epoch,
+                "val_mIoU": val_iou,
+            },
+            last_decoder_path,
+        )
+        torch.save(
+            {
+                "model": model.state_dict(),
+                "model_type": C.medsam_model_type,
+                "epoch": epoch,
+                "val_mIoU": val_iou,
+            },
+            last_full_path,
+        )
+
+        # save best
+        if val_iou > best_iou:
+            best_iou = val_iou
+            torch.save(
+                {
+                    "mask_decoder": model.mask_decoder.state_dict(),
+                    "model_type": C.medsam_model_type,
+                    "epoch": epoch,
+                    "val_mIoU": val_iou,
+                },
+                best_decoder_path,
+            )
+            torch.save(
+                {
+                    "model": model.state_dict(),
+                    "model_type": C.medsam_model_type,
+                    "epoch": epoch,
+                    "val_mIoU": val_iou,
+                },
+                best_full_path,
+            )
+            print(
+                f"  ✅ New best mIoU {best_iou:.4f} saved:\n"
+                f"     - decoder: {best_decoder_path.name}\n"
+                f"     - full   : {best_full_path.name}"
+            )
+
+    print("\nMedSAM training done.")
+    print(f"Best mIoU: {best_iou:.4f}")
+
+
 
 # --------- CLI ---------
 def parse_args():
@@ -469,7 +568,7 @@ def parse_args():
         "--model",
         type=str,
         default="sam",
-        choices=["sam", "hqsam"],
+        choices=["sam", "hqsam", "medsam"],
         help="Which model backend to train.",
     )
     return p.parse_args()
@@ -492,6 +591,8 @@ def main():
         train_sam(device)
     elif args.model == "hqsam":
         train_hqsam(device)
+    elif args.model == "medsam":
+        train_medsam(device)
     else:
         raise ValueError(f"Unknown model: {args.model}")
 

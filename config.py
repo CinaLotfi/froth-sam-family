@@ -7,6 +7,7 @@ class Config:
     Works for:
       - SAM      (model_name = "sam")
       - HQ-SAM   (model_name = "hqsam")
+      - MedSAM   (model_name = "medsam")
     """
 
     # --------- paths ----------
@@ -26,7 +27,7 @@ class Config:
     # --------- training basics ----------
     seed = 1337
     device = "auto"        # "cuda" | "cpu" | "auto"
-    batch_size = 1         # keep 1 for SAM / HQ-SAM box prompts
+    batch_size = 1         # keep 1 for SAM / HQ-SAM / MedSAM box prompts
     num_workers = 0
     pin_memory = True
 
@@ -36,17 +37,21 @@ class Config:
     weight_decay = 0.0
 
     # --------- model selection ----------
-    # will be set via CLI: --model sam / --model hqsam
-    model_name = "sam"            # "sam" | "hqsam"
+    # will be set via CLI: --model sam / --model hqsam / --model medsam
+    model_name = "sam"            # "sam" | "hqsam" | "medsam"
     train_mode = "decoder_only"   # just used in filenames
 
-    # --------- SAM settings ----------
-    sam_model_type = "vit_b"
-    sam_checkpoint = weights_root / "sam_vit_b_01ec64.pth"
+    # SAM
+    sam_checkpoint   = weights_root / "sam_vit_b_01ec64.pth"
+    sam_model_type   = "vit_b"
 
-    # --------- HQ-SAM settings ----------
-    hqsam_model_type = "vit_b"
+    # HQ-SAM
     hqsam_checkpoint = weights_root / "sam_hq_vit_b.pth"
+    hqsam_model_type = "vit_b"
+
+    # MedSAM (NEW)
+    medsam_checkpoint = weights_root / "medsam_vit_b.pth"
+    medsam_model_type = "vit_b"
 
     # set in setup()
     finetune_out = outputs_root / "sam_finetune_out"
@@ -63,6 +68,7 @@ class Config:
         elif cls.model_name.lower() == "hqsam":
             subdir = "hqsam_finetune_out"
         else:
+            # e.g. "medsam_finetune_out"
             subdir = f"{cls.model_name}_finetune_out"
 
         cls.finetune_out = cls.outputs_root / subdir

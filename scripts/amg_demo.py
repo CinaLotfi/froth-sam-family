@@ -5,17 +5,16 @@ import numpy as np
 import torch
 import cv2
 import matplotlib.pyplot as plt
-from torch.utils.data import DataLoader
 
 from config import Config as C
-from sam_froth.data.froth_dataset import FrothSegmentationDataset
+from sam_froth.data.froth_dataset import FrothSegmentationDataset, preprocess_image_for_sam
 from sam_froth.models import (
     load_sam_base,
     load_hqsam,
+    load_medsam,
     postprocess_masks_to_original,
 )
 from sam_froth.models.hqsam import encode_image_hq
-from sam_froth.data.froth_dataset import preprocess_image_for_sam  # we’ll reuse 1024-preprocess
 
 
 # --------- utils ---------
@@ -59,7 +58,9 @@ def pick_dataset(split: str):
     return ds
 
 
-# --------- SAM AMG (uses official SamAutomaticMaskGenerator) ---------
+# --------------------------------------------------
+#  SAM AMG (official SamAutomaticMaskGenerator)
+# --------------------------------------------------
 def amg_sam(device: torch.device, idx: int, split: str):
     from segment_anything import SamAutomaticMaskGenerator
 
@@ -83,7 +84,8 @@ def amg_sam(device: torch.device, idx: int, split: str):
         device=device,
     )
     state = torch.load(ckpt_path, map_location=device)
-    sam.load_state_dict(state["model"], strict=True)
+    sd = state["model"] if isinstance(state, dict) and "model" in state else state
+    sam.load_state_dict(sd, strict=True)
     sam.eval()
 
     # AMG generator
@@ -138,7 +140,9 @@ def amg_sam(device: torch.device, idx: int, split: str):
     plt.tight_layout(); plt.show()
 
 
-# --------- HQ-SAM AMG (custom generator) ---------
+# --------------------------------------------------
+#  HQ-SAM AMG (custom grid generator)
+# --------------------------------------------------
 def hq_amg_generate(
     image_raw_hwc_uint8,
     model,
@@ -252,7 +256,8 @@ def amg_hqsam(device: torch.device, idx: int, split: str):
         device=device,
     )
     state = torch.load(ckpt_path, map_location=device)
-    sam_hq.load_state_dict(state["model"], strict=True)
+    sd = state["model"] if isinstance(state, dict) and "model" in state else state
+    sam_hq.load_state_dict(sd, strict=True)
     sam_hq.eval()
 
     masks = hq_amg_generate(
@@ -306,14 +311,94 @@ def amg_hqsam(device: torch.device, idx: int, split: str):
     plt.tight_layout(); plt.show()
 
 
+# --------------------------------------------------
+#  MedSAM AMG (use SamAutomaticMaskGenerator too)
+# --------------------------------------------------
+def amg_medsam(device: torch.device, idx: int, split: str):
+    from segment_anything import SamAutomaticMaskGenerator
+
+    ds = pick_dataset(split)
+    assert 0 <= idx < len(ds), f"Index {idx} out of range (0..{len(ds)-1})"
+
+    image_raw, gt_mask = ds[idx]
+
+    # load finetuned MedSAM full model
+    model_tag = f"{C.model_name}_{C.medsam_model_type}_{C.train_mode}"
+    ckpt_path = C.finetune_out / f"{model_tag}_full_best.pth"
+    if not ckpt_path.exists():
+        raise FileNotFoundError(
+            f"MedSAM finetuned checkpoint not found at:\n  {ckpt_path}\n"
+            "Run: python -m scripts.train --model medsam"
+        )
+
+    sam_med = load_medsam(
+        checkpoint_path=C.medsam_checkpoint,
+        model_type=C.medsam_model_type,
+        device=device,
+    )
+    state = torch.load(ckpt_path, map_location=device)
+    sd = state["model"] if isinstance(state, dict) and "model" in state else state
+    sam_med.load_state_dict(sd, strict=True)
+    sam_med.eval()
+
+    generator = SamAutomaticMaskGenerator(
+        model=sam_med,
+        points_per_side=32,
+        pred_iou_thresh=0.5,       # slightly relaxed vs SAM
+        stability_score_thresh=0.5,
+        min_mask_region_area=1,
+    )
+
+    masks = generator.generate(image_raw)
+    print(f"[MedSAM AMG] produced {len(masks)} masks")
+
+    overlay = image_raw.copy()
+    union = np.zeros(image_raw.shape[:2], np.uint8)
+    colors = [
+        (255, 0, 0),
+        (0, 255, 0),
+        (0, 0, 255),
+        (255, 255, 0),
+        (255, 0, 255),
+        (0, 255, 255),
+        (255, 128, 0),
+        (128, 0, 255),
+    ]
+
+    n_contours = 0
+    for i, m in enumerate(masks):
+        seg = (m["segmentation"].astype(np.uint8) * 255)
+        union |= seg
+
+        cnts, _ = cv2.findContours(seg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not cnts:
+            continue
+        cnt = max(cnts, key=cv2.contourArea)
+        if cv2.contourArea(cnt) < 10:
+            continue
+
+        color = colors[i % len(colors)]
+        cv2.drawContours(overlay, [cnt], -1, color, 1, lineType=cv2.LINE_AA)
+        n_contours += 1
+
+    print("Contours drawn:", n_contours)
+
+    plt.figure(figsize=(15, 4))
+    plt.subplot(1, 3, 1); plt.title(f"Original #{idx}"); plt.imshow(image_raw); plt.axis("off")
+    plt.subplot(1, 3, 2); plt.title("GT mask"); plt.imshow(gt_mask, cmap="gray"); plt.axis("off")
+    plt.subplot(1, 3, 3); plt.title(f"MedSAM AMG (n_masks={len(masks)}, contours={n_contours})")
+    plt.imshow(overlay); plt.axis("off")
+    plt.tight_layout(); plt.show()
+
+
 # --------- CLI ---------
 def parse_args():
-    p = argparse.ArgumentParser(description="AMG-style visualization for SAM / HQ-SAM.")
+    p = argparse.ArgumentParser(description="AMG-style visualization for SAM / HQ-SAM / MedSAM.")
     p.add_argument(
         "--model",
         type=str,
         default="sam",
-        choices=["sam", "hqsam"],
+        choices=["sam", "hqsam", "medsam"],
         help="Which model backend to use.",
     )
     p.add_argument(
@@ -346,6 +431,8 @@ def main():
         amg_sam(device, idx=args.idx, split=args.split)
     elif args.model == "hqsam":
         amg_hqsam(device, idx=args.idx, split=args.split)
+    elif args.model == "medsam":
+        amg_medsam(device, idx=args.idx, split=args.split)
     else:
         raise ValueError(f"Unknown model: {args.model}")
 
