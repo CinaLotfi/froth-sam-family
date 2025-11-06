@@ -1,3 +1,4 @@
+import argparse
 import random
 from pathlib import Path
 
@@ -9,12 +10,14 @@ from config import Config as C
 from sam_froth.data.froth_dataset import FrothSegmentationDataset, collate_froth
 from sam_froth.models import (
     load_sam_base,
+    load_hqsam,
     boxes_to_1024_space,
     postprocess_masks_to_original,
 )
-from sam_froth.utils.metrics import iou_binary
+from sam_froth.models.hqsam import encode_image_hq
 
 
+# --------- utils ---------
 def set_seed(seed: int = 1337):
     random.seed(seed)
     np.random.seed(seed)
@@ -31,65 +34,118 @@ def get_device() -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def build_test_loader(device: torch.device):
-    test_ds = FrothSegmentationDataset(C.test_dir, label_key=C.label_key)
-    pin = C.pin_memory and (device.type == "cuda")
-    test_loader = DataLoader(
-        test_ds,
+def build_loader():
+    """
+    Eval priority:
+      1) eval_dir  (if exists and non-empty)
+      2) test_dir
+      3) train_dir
+    """
+    if C.eval_dir.exists() and any(C.eval_dir.iterdir()):
+        root = C.eval_dir
+        split_name = "eval"
+    elif C.test_dir.exists() and any(C.test_dir.iterdir()):
+        root = C.test_dir
+        split_name = "test"
+    else:
+        root = C.train_dir
+        split_name = "train"
+
+    ds = FrothSegmentationDataset(root, label_key=C.label_key)
+    loader = DataLoader(
+        ds,
         batch_size=C.batch_size,
         shuffle=False,
         num_workers=C.num_workers,
-        pin_memory=pin,
+        pin_memory=(get_device().type == "cuda") and C.pin_memory,
         collate_fn=collate_froth,
     )
-    print(f"Test samples: {len(test_ds)}")
-    return test_loader
+    print(f"Evaluating on {len(ds)} samples from [{split_name}] dir: {root}")
+    return loader
 
 
-def load_finetuned_model(device: torch.device):
-    if C.model_name.lower() != "sam":
-        raise NotImplementedError("Eval currently implemented only for model_name='sam'.")
+def compute_iou_and_dice(pred_mask: np.ndarray, true_mask: np.ndarray, eps: float = 1e-6):
+    """
+    pred_mask, true_mask: (H,W) binary arrays (0/1 or False/True)
+    """
+    pred = pred_mask.astype(bool)
+    target = true_mask.astype(bool)
 
-    # base SAM
+    inter = np.logical_and(pred, target).sum()
+    union = np.logical_or(pred, target).sum()
+    iou = (inter + eps) / (union + eps)
+
+    dice = (2 * inter + eps) / (pred.sum() + target.sum() + eps)
+    return float(iou), float(dice)
+
+
+# --------- model loading ---------
+def load_finetuned_sam(device: torch.device):
     model = load_sam_base(
         checkpoint_path=C.sam_checkpoint,
         model_type=C.sam_model_type,
         device=device,
     )
 
-    # expected checkpoint path (same pattern as train.py)
     model_tag = f"{C.model_name}_{C.sam_model_type}_{C.train_mode}"
     ckpt_path = C.finetune_out / f"{model_tag}_full_best.pth"
 
     if not ckpt_path.exists():
         raise FileNotFoundError(
-            f"Finetuned checkpoint not found at:\n  {ckpt_path}\n"
-            "Run scripts/train.py first or adjust the path logic."
+            f"SAM finetuned checkpoint not found at:\n  {ckpt_path}\n"
+            "Run: python -m scripts.train --model sam"
         )
 
     state = torch.load(ckpt_path, map_location=device)
     model.load_state_dict(state["model"], strict=True)
     model.eval()
-    print(f"Loaded finetuned model from: {ckpt_path}")
-    print(f"  epoch={state.get('epoch')}, val_mIoU={state.get('val_mIoU'):.4f}")
+    print(f"Loaded SAM finetuned model: {ckpt_path.name}")
     return model
 
 
-@torch.no_grad()
-def evaluate(model: torch.nn.Module, loader: DataLoader, device: torch.device) -> float:
+def load_finetuned_hqsam(device: torch.device):
+    model = load_hqsam(
+        checkpoint_path=C.hqsam_checkpoint,
+        model_type=C.hqsam_model_type,
+        device=device,
+    )
+
+    model_tag = f"{C.model_name}_{C.hqsam_model_type}_{C.train_mode}"
+    ckpt_path = C.finetune_out / f"{model_tag}_full_best.pth"
+
+    if not ckpt_path.exists():
+        raise FileNotFoundError(
+            f"HQ-SAM finetuned checkpoint not found at:\n  {ckpt_path}\n"
+            "Run: python -m scripts.train --model hqsam"
+        )
+
+    state = torch.load(ckpt_path, map_location=device)
+    model.load_state_dict(state["model"], strict=True)
     model.eval()
-    ious = []
+    print(f"Loaded HQ-SAM finetuned model: {ckpt_path.name}")
+    return model
+
+
+# --------- eval backends ---------
+@torch.no_grad()
+def eval_sam(device: torch.device, threshold: float):
+    loader = build_loader()
+    model = load_finetuned_sam(device)
+
+    all_ious = []
+    all_dices = []
 
     for batch in loader:
         images_1024 = batch["images_1024"].to(device)
         boxes = batch["boxes"].to(device)
         orig_hw = batch["orig_sizes"].to(device)
         input_hw = batch["input_sizes"].to(device)
+        targets_l = batch["masks"]  # list[(H,W) float {0,1}]
 
-        # encode image
+        # encoder
         img_embed = model.image_encoder(images_1024)
 
-        # prompt: full-image box in 1024-space
+        # prompts
         boxes_1024 = boxes_to_1024_space(boxes, orig_hw)
         sparse_emb, dense_emb = model.prompt_encoder(
             points=None,
@@ -97,7 +153,7 @@ def evaluate(model: torch.nn.Module, loader: DataLoader, device: torch.device) -
             masks=None,
         )
 
-        # decode
+        # decoder
         lowres_logits, _ = model.mask_decoder(
             image_embeddings=img_embed,
             image_pe=model.prompt_encoder.get_dense_pe(),
@@ -106,33 +162,120 @@ def evaluate(model: torch.nn.Module, loader: DataLoader, device: torch.device) -
             multimask_output=False,
         )
 
-        # postprocess to original size
-        up_logits = postprocess_masks_to_original(lowres_logits, input_hw, orig_hw)
+        # postprocess and metrics
+        up_logits = postprocess_masks_to_original(lowres_logits, input_hw, orig_hw)  # (B,1,H,W)
         probs = torch.sigmoid(up_logits)
-        preds = (probs > 0.5).float()  # (B,1,H,W)
+        preds = (probs > threshold).float()
 
         B = preds.shape[0]
         for i in range(B):
-            gt = batch["masks"][i].to(device).float()           # (H,W)
-            p = preds[i, 0]                                     # (H,W)
-            iou = iou_binary(p, gt)
-            ious.append(iou)
+            pred_np = preds[i, 0].cpu().numpy()
+            gt_np = targets_l[i].cpu().numpy()  # (H,W) 0/1
 
-    mean_iou = float(np.mean(ious)) if ious else 0.0
-    return mean_iou
+            iou, dice = compute_iou_and_dice(pred_np, gt_np)
+            all_ious.append(iou)
+            all_dices.append(dice)
+
+    mean_iou = float(np.mean(all_ious)) if all_ious else 0.0
+    mean_dice = float(np.mean(all_dices)) if all_dices else 0.0
+
+    print(f"\n[SAM] Eval @ thr={threshold:.2f} → mIoU={mean_iou:.4f}, mDice={mean_dice:.4f}")
+    return mean_iou, mean_dice
+
+
+@torch.no_grad()
+def eval_hqsam(device: torch.device, threshold: float):
+    loader = build_loader()
+    model = load_finetuned_hqsam(device)
+
+    all_ious = []
+    all_dices = []
+
+    for batch in loader:
+        images_1024 = batch["images_1024"].to(device)
+        boxes = batch["boxes"].to(device)
+        orig_hw = batch["orig_sizes"].to(device)
+        input_hw = batch["input_sizes"].to(device)
+        targets_l = batch["masks"]
+
+        # HQ encoder: img_embed + interm_embeddings
+        img_embed, interm_embeddings = encode_image_hq(model, images_1024)
+
+        # prompts
+        boxes_1024 = boxes_to_1024_space(boxes, orig_hw)
+        sparse_emb, dense_emb = model.prompt_encoder(
+            points=None,
+            boxes=boxes_1024.unsqueeze(1),
+            masks=None,
+        )
+
+        # HQ decoder
+        lowres_logits, _ = model.mask_decoder(
+            image_embeddings=img_embed,
+            image_pe=model.prompt_encoder.get_dense_pe(),
+            sparse_prompt_embeddings=sparse_emb,
+            dense_prompt_embeddings=dense_emb,
+            multimask_output=False,
+            hq_token_only=True,
+            interm_embeddings=interm_embeddings,
+        )
+
+        # postprocess and metrics
+        up_logits = postprocess_masks_to_original(lowres_logits, input_hw, orig_hw)  # (B,1,H,W)
+        probs = torch.sigmoid(up_logits)
+        preds = (probs > threshold).float()
+
+        B = preds.shape[0]
+        for i in range(B):
+            pred_np = preds[i, 0].cpu().numpy()
+            gt_np = targets_l[i].cpu().numpy()
+
+            iou, dice = compute_iou_and_dice(pred_np, gt_np)
+            all_ious.append(iou)
+            all_dices.append(dice)
+
+    mean_iou = float(np.mean(all_ious)) if all_ious else 0.0
+    mean_dice = float(np.mean(all_dices)) if all_dices else 0.0
+
+    print(f"\n[HQ-SAM] Eval @ thr={threshold:.2f} → mIoU={mean_iou:.4f}, mDice={mean_dice:.4f}")
+    return mean_iou, mean_dice
+
+
+# --------- CLI ---------
+def parse_args():
+    p = argparse.ArgumentParser(description="Evaluate froth SAM-family models.")
+    p.add_argument(
+        "--model",
+        type=str,
+        default="sam",
+        choices=["sam", "hqsam"],
+        help="Which model backend to evaluate.",
+    )
+    p.add_argument(
+        "--thr",
+        type=float,
+        default=0.5,
+        help="Probability threshold to binarize masks.",
+    )
+    return p.parse_args()
 
 
 def main():
+    args = parse_args()
+
+    C.model_name = args.model.lower()
     C.setup()
     set_seed(C.seed)
     device = get_device()
-    print(f"Using device: {device}")
 
-    test_loader = build_test_loader(device)
-    model = load_finetuned_model(device)
+    print(f"Using model: {C.model_name} | device: {device}")
 
-    mean_iou = evaluate(model, test_loader, device)
-    print(f"\nFinal mean IoU on test set: {mean_iou:.4f}")
+    if args.model == "sam":
+        eval_sam(device, threshold=args.thr)
+    elif args.model == "hqsam":
+        eval_hqsam(device, threshold=args.thr)
+    else:
+        raise ValueError(f"Unknown model: {args.model}")
 
 
 if __name__ == "__main__":

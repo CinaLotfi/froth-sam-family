@@ -1,0 +1,47 @@
+# ---- Python basics ----
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.dll
+
+# Virtual envs
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE / editor stuff
+.vscode/
+.idea/
+*.code-workspace
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+*.log
+
+# ---- Project-specific ----
+
+# Large data + private dataset
+data/
+
+
+# Weights / checkpoints (SAM, finetuned models, etc.)
+weights/
+outputs/
+samout/
+
+# If you ever export figures or temp stuff
+figures/
+tmp/
+temp/
